@@ -11,6 +11,15 @@ Este proyecto implementa un chatbot avanzado que combina múltiples tecnologías
 - **LangGraph**: Flujos de conversación complejos con decisiones inteligentes
 - **Dual Model Architecture**: Dos modelos LLM especializados para diferentes tareas
 
+**Colaboración recibida:**
+- Implementación del procesamiento de imágenes con asistencia de IA
+- Debugging y optimización de la arquitectura LangGraph
+
+**Mi contribución:**
+- Diseño de la arquitectura dual de modelos
+- Integración completa del sistema
+- Documentación del código
+  
 ## Características Principales
 
 ### Procesamiento de Documentos
