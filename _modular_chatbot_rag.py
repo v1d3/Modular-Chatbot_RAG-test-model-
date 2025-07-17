@@ -1,4 +1,4 @@
-#ollama run deepseek-r1
+
 #panel serve "file_name.py"
 
 """
@@ -49,6 +49,7 @@ filename_selector = pn.widgets.Select(name="Nombre del archivo a eliminar (inclu
 # Botones de acción
 delete_button = pn.widgets.Button(name="Eliminar documento", button_type="danger")
 accept_doc_button = pn.widgets.Button(name="Añadir documentos", button_type="success")
+accept_image_button = pn.widgets.Button(name="Cargar imagen", button_type="primary")
 
 # Área para mostrar el estado de las operaciones
 status_text = pn.pane.Markdown("")
@@ -75,7 +76,7 @@ def process_uploaded_image():
     global current_image_data, current_image_name
     
     if not file_input.value:
-        status_text.object = "No se ha seleccionado ninguna imagen"
+        status_text.object = " No se ha seleccionado ninguna imagen"
         return
     
     try:
@@ -84,18 +85,20 @@ def process_uploaded_image():
         current_image_name = file_input.filename
         
         # Informar al usuario
-        status_text.object = f"Imagen '{current_image_name}' cargada. Ahora puedes hacer preguntas sobre ella en el chat."
+        status_text.object = f" Imagen '{current_image_name}' cargada exitosamente. Ahora puedes hacer preguntas sobre ella en el chat."
         
-        # Enviar mensaje automático al chat (si ya existe)
-        if hasattr(chat_interface, 'send'):
-            chat_interface.send(
-                f"📷 Imagen '{current_image_name}' cargada. ¿Qué te gustaría saber sobre esta imagen?", 
-                user="System", 
-                respond=False
-            )
+        print(f"[INFO] Imagen procesada: {current_image_name}, tamaño base64: {len(current_image_data)} caracteres")
+        
+        # Limpiar el widget de archivo para permitir nueva carga
+        file_input.value = None
+        file_input.filename = ""
             
     except Exception as e:
-        status_text.object = f"Error al procesar la imagen: {str(e)}"
+        print(f"[ERROR] Error al procesar imagen: {str(e)}")
+        status_text.object = f" Error al procesar la imagen: {str(e)}"
+        # Limpiar estado en caso de error
+        current_image_data = None
+        current_image_name = None
 
 
 # 1. PROMPT PARA RAG (Retrieval Augmented Generation)
@@ -304,9 +307,13 @@ def on_delete_click(event):
 def on_accept_click(event):
     process_file(event)
 
+def on_accept_image_click(event):
+    process_uploaded_image()
+
 # Conectar eventos
 delete_button.on_click(on_delete_click)
 accept_doc_button.on_click(on_accept_click)
+accept_image_button.on_click(on_accept_image_click)
 
 def update_filename_options():
     json_path = "uploaded_ids.json"
@@ -366,10 +373,15 @@ El estado contiene toda la información que se pasa entre nodos:
 """
 
 class State(TypedDict):
-    messages: List          # Mensajes
-    documents: List[str]    # Chunks de documentos relevantes (RAG)
-    branch: str            # Ruta elegida ("trivial", "not_trivial", etc.)
-    model_choice: str      # Modelo a usar ("text" o "multimodal")
+    question: str          # Pregunta del usuario
+    context: List          # Chunks de documentos relevantes (RAG)
+    answer: str           # Respuesta final del chatbot
+    session_id: str       # Identificador de sesión para memoria
+    image_data: str       # Imagen en base64 (vacío si no hay)
+    image_name: str       # Nombre del archivo de imagen
+    has_image: bool       # ¿Hay imagen en esta consulta?
+    branch: str           # Ruta elegida ("trivial", "not_trivial", etc.)
+    model_choice: str     # Modelo a usar ("text" o "multimodal")
 
 
 def is_trivial_question(text: str) -> bool:
@@ -401,11 +413,10 @@ def has_image_content(messages) -> bool:
 
 
 def check_trivial(state: State) -> State:
-    last_message = state["messages"][-1]
-    question = last_message.content
+    question = state["question"]
     
     is_trivial = is_trivial_question(question)
-    has_image = has_image_content(state["messages"])
+    has_image = state.get("has_image", False)
     
     print(f"[DEBUG] Pregunta: '{question[:30]}...' | Trivial: {is_trivial} | Imagen: {has_image}")
     
@@ -430,7 +441,10 @@ def trivial_node(state: State) -> State:
     session_id = state["session_id"]
     chat_history = get_chat_history(session_id)
     
-    response = chain_trivial.invoke({"question":state["question"]})
+    response = chain_trivial.invoke({
+        "question": state["question"],
+        "history": chat_history.messages
+    })
     
     # Guardar en memoria
     chat_history.add_messages([
@@ -438,38 +452,43 @@ def trivial_node(state: State) -> State:
         AIMessage(content=response.content)
     ])
     
-    return {**state, "answer":response.content}
+    return {**state, "answer": response.content}
 
 # NODO 2: Respuestas simples con imagen
 def trivial_image_node(state: State) -> State:
     """
     Maneja preguntas simples sobre imágenes que no requieren contexto documental.
     Ejemplo: "¿Qué ves en esta imagen?", "¿Qué colores tiene?"
-    
-    PROCESO:
-    1. Obtiene historial de la sesión
-    2. Invoca chain_image_trivial (prompt imagen + Mistral)
-    3. Guarda pregunta y respuesta en memoria
-    4. Retorna estado con respuesta
     """
-    session_id = state["session_id"]
-    chat_history = get_chat_history(session_id)
-    
-    # Preparar input con imagen
-    input_data = {
-        "question": state["question"],
-        "history": chat_history.messages,
-        "image_data": state["image_data"]
-    }
-    response = chain_image_trivial.invoke(input_data)
-    
-    # Guardar en memoria (marcando que había imagen)
-    chat_history.add_messages([
-        HumanMessage(content=f"[Imagen: {state['image_name']}] {state['question']}"),
-        AIMessage(content=response.content)
-    ])
-    
-    return {**state, "answer": response.content}
+    try:
+        session_id = state["session_id"]
+        chat_history = get_chat_history(session_id)
+        
+        # Verificar que tenemos datos de imagen
+        if not state.get("image_data"):
+            return {**state, "answer": " Error: No hay datos de imagen disponibles."}
+        
+        # Preparar input con imagen
+        input_data = {
+            "question": state["question"],
+            "history": chat_history.messages,
+            "image_data": state["image_data"]
+        }
+        
+        print(f"[INFO] Procesando imagen simple: {state['image_name']}")
+        response = chain_image_trivial.invoke(input_data)
+        
+        # Guardar en memoria
+        chat_history.add_messages([
+            HumanMessage(content=f"[Imagen: {state['image_name']}] {state['question']}"),
+            AIMessage(content=response.content)
+        ])
+        
+        return {**state, "answer": response.content}
+        
+    except Exception as e:
+        print(f"[ERROR] Error en trivial_image_node: {str(e)}")
+        return {**state, "answer": f" Error al procesar la imagen: {str(e)}"}
 
 
 def retrieve_node(state: State) -> State:
@@ -525,35 +544,40 @@ def generate_image_node(state: State) -> State:
     """
     Genera respuesta usando documentos + imagen + modelo multimodal.
     Para preguntas complejas con imagen.
-    
-    PROCESO:
-    1. Combina chunks relevantes en contexto
-    2. Invoca chain_image (prompt imagen + Mistral)
-    3. Guarda en memoria
-    4. Retorna respuesta
     """
-    session_id = state["session_id"]
-    chat_history = get_chat_history(session_id)
-    
-    # Combinar documentos en texto
-    docs_content = "\n\n".join(doc.page_content for doc in state["context"])
-    
-    # Preparar input con imagen Y contexto documental
-    input_data = {
-        "question": state["question"],
-        "context": docs_content,
-        "history": chat_history.messages,
-        "image_data": state["image_data"]
-    }
-    response = chain_image.invoke(input_data)
-    
-    # Guardar en memoria
-    chat_history.add_messages([
-        HumanMessage(content=f"[Imagen: {state['image_name']}] {state['question']}"),
-        AIMessage(content=response.content)
-    ])
+    try:
+        session_id = state["session_id"]
+        chat_history = get_chat_history(session_id)
+        
+        # Verificar que tenemos datos de imagen
+        if not state.get("image_data"):
+            return {**state, "answer": " Error: No hay datos de imagen disponibles para análisis complejo."}
+        
+        # Combinar documentos en texto
+        docs_content = "\n\n".join(doc.page_content for doc in state["context"])
+        
+        # Preparar input con imagen Y contexto documental
+        input_data = {
+            "question": state["question"],
+            "context": docs_content,
+            "history": chat_history.messages,
+            "image_data": state["image_data"]
+        }
+        
+        print(f"[INFO] Procesando imagen con RAG: {state['image_name']}")
+        response = chain_image.invoke(input_data)
+        
+        # Guardar en memoria
+        chat_history.add_messages([
+            HumanMessage(content=f"[Imagen: {state['image_name']}] {state['question']}"),
+            AIMessage(content=response.content)
+        ])
 
-    return {**state, "answer": response.content}
+        return {**state, "answer": response.content}
+        
+    except Exception as e:
+        print(f"[ERROR] Error en generate_image_node: {str(e)}")
+        return {**state, "answer": f"❌ Error al procesar imagen con documentos: {str(e)}"}
 
 
 # Crear el grafo
@@ -598,7 +622,6 @@ app = graph.compile()
 def callback(contents: str, user: str, instance: pn.chat.ChatInterface):
     global current_image_data, current_image_name
     
-    
     has_image = current_image_data is not None
     
     state: State = {
@@ -608,24 +631,30 @@ def callback(contents: str, user: str, instance: pn.chat.ChatInterface):
         "session_id": USER_SESSION_ID,
         "image_data": current_image_data or "",
         "image_name": current_image_name or "",
-        "has_image": has_image
+        "has_image": has_image,
+        "branch": "",
+        "model_choice": ""
     }
     
     try:
+        print(f"[INFO] Estado inicial: {state['question'][:30]}... | Imagen: {has_image}")
         result = app.invoke(state)
         
         # Limpiar imagen después del uso si había una
         if has_image:
             current_image_data = None
             current_image_name = None
+            print("[INFO] Imagen limpiada después del procesamiento")
             
         return result["answer"]
         
     except Exception as e:
+        print(f"[ERROR] Error en callback: {str(e)}")
         # En caso de error, limpiar imagen y reintentar sin imagen
         if has_image:
             current_image_data = None
             current_image_name = None
+            print("[INFO] Limpiando imagen debido a error")
             
             # Reintentar sin imagen
             state["has_image"] = False
@@ -634,18 +663,26 @@ def callback(contents: str, user: str, instance: pn.chat.ChatInterface):
             
             try:
                 result = app.invoke(state)
-                return f"Error al procesar la imagen: {str(e)}. Procesando como texto: {result['answer']}"
+                return f" Error al procesar la imagen: {str(e)}. Procesando como texto: {result['answer']}"
             except Exception as e2:
-                return f"Error al procesar la consulta: {str(e2)}"
+                return f" Error al procesar la consulta: {str(e2)}"
         else:
-            return f"Error al procesar la consulta: {str(e)}"
+            return f" Error al procesar la consulta: {str(e)}"
 
 # --------- Layout de la Interfaz ---------
 pn.Column(
-    "### Subir Documentos para RAG o Imágenes para Análisis", 
-    pn.pane.Markdown("**Documentos soportados**: PDF, CSV, Excel  \n**Imágenes soportadas**: JPG, PNG, GIF, BMP, WebP"),
-    file_input, accept_doc_button, status_text,
-    "### Eliminar documento por nombre", filename_selector, delete_button
+    "###  Subir Documentos para RAG", 
+    pn.pane.Markdown("**Documentos soportados**: PDF, CSV, Excel"),
+    pn.Row(file_input, accept_doc_button),
+    
+    "### 🖼️ Cargar Imágenes para Análisis", 
+    pn.pane.Markdown("**Imágenes soportadas**: JPG, PNG, GIF, BMP, WebP"),
+    pn.Row(accept_image_button),
+    
+    status_text,
+    
+    "### 🗑️ Eliminar documento por nombre", 
+    pn.Row(filename_selector, delete_button)
 ).servable()
 
 # --------- Interfaz de Chat ---------
@@ -653,6 +690,27 @@ chat_interface = pn.chat.ChatInterface(
     callback=callback, 
     callback_user="System", 
     callback_exception="verbose"
-    )
-chat_interface.send("Te ayudo en algo?", user="System", respond=False)
+)
+
+# Mensaje de bienvenida más informativo
+welcome_msg = """
+**¡Hola! Soy tu asistente RAG multimodal.**
+
+**¿Qué puedo hacer?**
+ Responder preguntas sobre documentos que subas (PDF, CSV, Excel)
+ Analizar imágenes que cargues
+ Combinar información de documentos e imágenes
+
+**¿Cómo empezar?**
+1. Sube documentos usando el botón "Añadir documentos"
+2. Carga imágenes usando el botón "Cargar imagen"  
+3. ¡Haz preguntas sobre el contenido!
+
+**Ejemplos:**
+• "¿Qué información contienen los documentos?"
+• "Analiza esta imagen"
+• "Compara la imagen con la información de los documentos"
+"""
+
+chat_interface.send(welcome_msg, user="Sistema", respond=False)
 chat_interface.servable()
